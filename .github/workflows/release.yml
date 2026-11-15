@@ -1,7 +1,11 @@
 # Builds EP Room Desktop from the private source commit named in release/SOURCE.json and publishes desktop-v<version> here.
 # Canonical copy: ena-pragma/ep-room electron/release-repo/.github/workflows/release.yml (synced by its desktop-release workflow).
 # Secrets: EP_ROOM_READ_KEY, a READ-ONLY deploy key of ena-pragma/ep-room (only the checkout steps get it).
-# No signing secrets exist yet: macOS is ad-hoc signed, Windows is unsigned (named UNSIGNED-TEST), Linux needs none.
+# macOS (only the Mac build step gets these): CSC_LINK (base64 Developer ID Application p12) and CSC_KEY_PASSWORD sign it;
+# APPLE_API_KEY (the App Store Connect .p8 contents), APPLE_API_KEY_ID and APPLE_API_ISSUER notarize it. With CSC_LINK set the
+# Mac build is Developer ID signed, notarized and stapled, and installs its own updates; without it the build falls back to
+# ad-hoc (EP_ROOM_MAC_ADHOC=1), which only tells the user to run `ep-room desktop update`.
+# Windows is unsigned (named UNSIGNED-TEST), Linux needs none.
 name: release
 
 on:
@@ -73,19 +77,62 @@ jobs:
           [ "$v" = "${{ needs.source.outputs.version }}" ] || { echo "electron/package.json says $v, SOURCE.json says ${{ needs.source.outputs.version }}"; exit 1; }
           npm ci --no-audit --no-fund
           node --test test/updater.test.cjs test/mac-release.test.cjs test/package-win.test.cjs test/security.test.cjs test/config.test.cjs
-      - name: Build (macOS, ad-hoc signed, arm64 + x64)
+      - name: Build (macOS arm64 + x64; Developer ID signed and notarized, or ad-hoc without the secrets)
         if: matrix.target == 'mac'
         working-directory: src/electron
         env:
-          EP_ROOM_MAC_ADHOC: '1'
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
-          node scripts/package-mac-release.mjs
-          mkdir -p ../../out && cd dist/mac-release
+          set -euo pipefail
+          out=$(cd ../.. && pwd)/out; mkdir -p "$out"
+          if [ -z "$CSC_LINK" ]; then
+            echo "::warning::CSC_LINK is not set: this Mac build is ad-hoc signed and cannot install its own updates"
+            unset CSC_LINK CSC_KEY_PASSWORD APPLE_API_KEY_ID APPLE_API_ISSUER
+            EP_ROOM_MAC_ADHOC=1 node scripts/package-mac-release.mjs
+            signed=0
+          else
+            [ -n "$CSC_KEY_PASSWORD" ] && [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER" ] \
+              || { echo "CSC_LINK is set, so CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER must be too"; exit 1; }
+            key="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"; printf '%s\n' "$APPLE_API_KEY_P8" > "$key"; chmod 600 "$key"
+            unset APPLE_API_KEY_P8
+            # electron-builder imports CSC_LINK into a temporary keychain, signs with the hardened runtime and the entitlements,
+            # notarizes the app with the API key (APPLE_API_KEY is the key file's path) and staples the ticket before zipping.
+            APPLE_API_KEY="$key" CSC_IDENTITY_AUTO_DISCOVERY=true EP_ROOM_MAC_X64=1 node scripts/package-mac-release.mjs
+            signed=1
+          fi
+          cd dist/mac-release
+          if [ "$signed" = 1 ]; then
+            # The dmg is notarized and stapled too (a first install opens without a warning); stapling changes its bytes, so
+            # latest-mac.yml's dmg entries are refreshed after.
+            for d in EP-Room-Desktop-*-arm64.dmg EP-Room-Desktop-*-x64.dmg; do
+              xcrun notarytool submit "$d" --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait --timeout 30m
+              xcrun stapler staple "$d"
+              xcrun stapler validate "$d"
+            done
+            node ../../scripts/refresh-update-yml.cjs latest-mac.yml EP-Room-Desktop-*.dmg
+            rm -f EP-Room-Desktop-*.dmg.blockmap   # made before stapling, so stale; the updater uses the zip's
+            rm -f "$key"
+          fi
           for z in EP-Room-Desktop-*-arm64.zip EP-Room-Desktop-*-x64.zip; do
-            d=$(mktemp -d); ditto -x -k "$z" "$d"; codesign --verify --deep --strict "$d/EP Room Desktop.app"
-            echo "$z: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$d/EP Room Desktop.app/Contents/Info.plist"), $(lipo -archs "$d/EP Room Desktop.app/Contents/MacOS/EP Room Desktop"), signature ok"
+            d=$(mktemp -d); ditto -x -k "$z" "$d"; app="$d/EP Room Desktop.app"
+            codesign --verify --deep --strict "$app"
+            if [ "$signed" = 1 ]; then
+              # Captured first: grep -q quits early, and under pipefail that can fail a pipe whose signature is fine.
+              info=$(codesign -dvv "$app" 2>&1); ents=$(codesign -d --entitlements - "$app" 2>/dev/null)
+              grep -q '^Authority=Developer ID Application:' <<<"$info" || { echo "$z: not Developer ID signed"; exit 1; }
+              grep -q 'device.audio-input' <<<"$ents" || { echo "$z: no audio-input entitlement"; exit 1; }
+              sp=$(spctl --assess --type execute -vv "$app" 2>&1 || true)
+              echo "$sp" | grep -q 'accepted' && echo "$sp" | grep -q 'Notarized Developer ID' || { echo "$z: spctl: $sp"; exit 1; }
+              xcrun stapler validate "$app"
+            fi
+            echo "$z: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist"), $(lipo -archs "$app/Contents/MacOS/EP Room Desktop"), $([ "$signed" = 1 ] && echo 'Developer ID, notarized, stapled' || echo 'ad-hoc'), signature ok"
           done
-          cp EP-Room-Desktop-*.zip EP-Room-Desktop-*.dmg *.blockmap latest-mac.yml ../../../../out/
+          echo "signed=$signed" > "$out/mac-signing.txt"
+          cp EP-Room-Desktop-*.zip EP-Room-Desktop-*.dmg *.blockmap latest-mac.yml "$out/"
       - name: Build (Windows x64, unsigned)
         if: matrix.target == 'win'
         working-directory: src/electron
@@ -126,6 +173,9 @@ jobs:
         run: |
           v='${{ needs.source.outputs.version }}'
           for f in latest-mac.yml latest.yml latest-linux.yml; do grep -q "^version: $v$" "$f" || { echo "$f is not version $v"; exit 1; }; done
+          # mac-signing.txt is the Mac build's note to the release text, not a release file.
+          if grep -qx 'signed=1' mac-signing.txt; then mac='Developer ID signed and notarized; updates install themselves.'; else mac='ad-hoc signed, not notarized.'; fi
+          echo "MAC_SIGNING=$mac" >> "$GITHUB_ENV"; rm -f mac-signing.txt
           sha256sum * > SHA256SUMS
           cat SHA256SUMS; { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish desktop-v${{ needs.source.outputs.version }}
@@ -137,7 +187,7 @@ jobs:
           notes="EP Room Desktop $v, built from source ${c:0:7}.
 
           Install or update: \`npx -y github:ena-pragma/ep-room-desktop\` or \`ep-room desktop update\`.
-          macOS: ad-hoc signed, not notarized. Windows: unsigned. Checksums: SHA256SUMS."
+          macOS: $MAC_SIGNING Windows: unsigned. Checksums: SHA256SUMS."
           gh release create "desktop-v$v" files/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "EP Room Desktop $v" --notes "$notes" --latest
       - name: Read the feed back
         run: |

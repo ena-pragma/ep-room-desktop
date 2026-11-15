@@ -23,12 +23,10 @@ On a Mac it replaces `EP Room Desktop.app` in `~/Applications` (or `/Application
 
 ## Signing
 
-- macOS builds are ad-hoc signed and not notarized until a Developer ID certificate exists. The command above clears the
-  download quarantine. Installing from a dmg on this page by hand: the first open is refused; then System Settings,
-  Privacy & Security, "Open Anyway".
+- macOS builds (0.3.4 on) are signed with a Developer ID, notarized by Apple and stapled: Gatekeeper accepts them with no "Open Anyway" step.
 - Windows installers are unsigned (`UNSIGNED-TEST` in the name): SmartScreen asks once ("More info", "Run anyway").
 - The app checks this feed at launch and every 6 hours. Windows and Linux (AppImage) update themselves and install on
-  quit; an ad-hoc Mac build tells you to run `ep-room desktop update`.
+  quit; so does a Mac on 0.3.4 or later. An older (ad-hoc) Mac build tells you to run `ep-room desktop update` once.
 
 ## How a release is made
 
