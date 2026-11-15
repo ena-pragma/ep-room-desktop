@@ -8,7 +8,12 @@ on:
   push:
     branches: [main]
     paths: ['release/SOURCE.json']
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build only; publish nothing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -41,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: mac, os: macos-14 }
+          - { target: mac, os: macos-15 }
           - { target: win, os: windows-2022 }
           - { target: linux, os: ubuntu-22.04 }
     runs-on: ${{ matrix.os }}
@@ -107,6 +112,7 @@ jobs:
 
   publish:
     needs: [source, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

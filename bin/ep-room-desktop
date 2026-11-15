@@ -117,29 +117,58 @@ const stamp = () => { const d = new Date(), p = n => String(n).padStart(2, '0');
 // The watcher a running app gets (from install-when-quit.sh): wait until the app is not running, then swap, keep the old
 // app in _rollback, verify, and put the old one back on any failure. Never quits the app, never relaunches it.
 const WATCHER = `#!/bin/bash
-NEW="$1"; APP="$2"; LOG="$3"; ROLLBACK="$(dirname "$APP")/_rollback"
+# One watcher at a time (the CLI stops an earlier one before it starts this), and a lock around the swap besides.
+NEW="$1"; APP="$2"; LOG="$3"; LOCK="$4"; ROLLBACK="$(dirname "$APP")/_rollback"
 say() { echo "$(date "+%Y-%m-%d %I:%M:%S %p") $*" >> "$LOG"; }
 running() { pgrep -f "$APP/Contents/MacOS/" >/dev/null; }
 end=$(( $(date +%s) + 7*86400 ))
 say "armed (pid $$): $NEW waits for EP Room Desktop to be quit (up to 7 days)"
 while running; do [ "$(date +%s)" -ge "$end" ] && { say "gave up after 7 days, nothing changed"; exit 1; }; sleep 5; done
 sleep 2; running && exec "$0" "$@"
-mkdir -p "$ROLLBACK"; BAK="$ROLLBACK/EP Room Desktop.app.bak-$(date +%Y%m%d-%H%M%S)"
-if [ -d "$APP" ]; then mv "$APP" "$BAK" || { say "could not move the old app aside, nothing changed"; exit 1; }; fi
+mkdir "$LOCK" 2>/dev/null || { say "another install holds $LOCK, nothing changed"; exit 1; }
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+mkdir -p "$ROLLBACK"; BAK=""
+if [ -d "$APP" ]; then BAK="$ROLLBACK/EP Room Desktop.app.bak-$(date +%Y%m%d-%H%M%S)"; mv "$APP" "$BAK" || { say "could not move the old app aside, nothing changed"; exit 1; }; fi
 if ditto "$NEW" "$APP" && codesign --verify --deep --strict "$APP" 2>>"$LOG"; then
-  say "installed $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist"); old app kept at $BAK"
+  say "installed $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")\${BAK:+; old app kept at $BAK}"
   rm -rf "$(dirname "$NEW")"
+  ls -1d "$ROLLBACK"/"EP Room Desktop.app.bak-"20[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | sort -r | tail -n +3 | while read -r old; do rm -rf "$old"; done
 else
-  say "install failed, putting the old app back"; rm -rf "$APP"; [ -d "$BAK" ] && mv "$BAK" "$APP"; exit 1
+  say "install failed, putting the old app back"
+  # Only what this watcher put there is removed, and only when there is an old app to put back.
+  if [ -n "$BAK" ] && [ -d "$BAK" ]; then rm -rf "$APP"; mv "$BAK" "$APP"; fi
+  exit 1
 fi
 `;
+
+/** Stops the watcher an earlier run started (only that one: its pid, and only while its command line is our watcher), and
+ *  removes the app it had staged. It never touches EP Room Desktop itself. */
+function stopWatcher(pidFile, watcher) {
+  // An earlier watcher is swapping right now (its lock is held): never interrupt a copy half done.
+  if (fs.existsSync(path.join(path.dirname(pidFile), 'swap.lock'))) throw new Error('An EP Room Desktop install is in progress. Run this again in a minute.');
+  let prev = null;
+  try { prev = JSON.parse(fs.readFileSync(pidFile, 'utf8')); } catch { return; }
+  const pid = Number(prev && prev.pid);
+  if (pid > 1) {
+    const cmd = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).stdout || '';
+    if (cmd.includes(watcher)) { try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ } }
+  }
+  if (prev && typeof prev.stage === 'string' && prev.stage.startsWith(path.dirname(pidFile) + path.sep)) fs.rmSync(prev.stage, { recursive: true, force: true });
+  fs.rmSync(pidFile, { force: true });
+}
+
+/** Keeps the newest two app copies this tool left in _rollback. */
+function pruneRollback(rb) {
+  let olds = [];
+  try { olds = fs.readdirSync(rb).filter(n => /^EP Room Desktop\.app\.bak-\d{8}-\d{6}$/.test(n)).sort(); } catch { return; }
+  for (const n of olds.slice(0, -2)) fs.rmSync(path.join(rb, n), { recursive: true, force: true });
+}
 
 function macInstall(zip, version, { stage }) {
   const { app, version: had } = macInstalled();
   const updates = path.join(os.homedir(), 'Library', 'Application Support', 'EP Room Desktop Updates');
-  const dir = path.join(updates, version);
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(updates, { recursive: true });
+  const dir = fs.mkdtempSync(path.join(updates, `stage-${version}-`));   // unique: a watcher may still hold an older one
   execFileSync('ditto', ['-x', '-k', zip, dir]);
   const fresh = path.join(dir, APP_NAME);
   if (!fs.existsSync(fresh)) throw new Error('The zip holds no EP Room Desktop.app.');
@@ -150,12 +179,16 @@ function macInstall(zip, version, { stage }) {
   if (stage || macRunning(app)) {
     const log = path.join(updates, 'install.log');
     const watcher = path.join(updates, 'install-when-quit.sh');
+    const pidFile = path.join(updates, 'watcher.json');
+    stopWatcher(pidFile, watcher);
     fs.writeFileSync(watcher, WATCHER, { mode: 0o755 });
-    const child = spawn('/bin/bash', [watcher, fresh, app, log], { detached: true, stdio: 'ignore' });
+    const child = spawn('/bin/bash', [watcher, fresh, app, log, path.join(updates, 'swap.lock')], { detached: true, stdio: 'ignore' });
+    fs.writeFileSync(pidFile, JSON.stringify({ pid: child.pid, stage: dir }));
     child.unref();
     console.log(`EP Room Desktop ${version} is staged; it installs the next time EP Room Desktop is quit (${had || 'nothing'} now). Log: ${log}`);
     return;
   }
+  stopWatcher(path.join(updates, 'watcher.json'), path.join(updates, 'install-when-quit.sh'));
   fs.mkdirSync(path.dirname(app), { recursive: true });
   let bak = '';
   if (fs.existsSync(app)) {
@@ -173,6 +206,7 @@ function macInstall(zip, version, { stage }) {
     throw new Error(`Installing failed, the old app is back: ${e.message}`);
   }
   fs.rmSync(dir, { recursive: true, force: true });
+  if (bak) pruneRollback(path.dirname(bak));
   console.log(`EP Room Desktop ${version} installed at ${app}${bak ? ` (old app kept at ${bak})` : ''}.`);
 }
 
@@ -185,6 +219,7 @@ function linuxVersion(deb) {
 }
 function linuxInstall(file, version, deb) {
   if (deb) {
+    if (spawnSync('pgrep', ['-x', 'ep-room-desktop'], { stdio: 'ignore' }).status === 0) throw new Error('EP Room Desktop is open. Quit it, then run this again (a deb replaces the files of a running app).');
     execFileSync('sudo', ['dpkg', '-i', file], { stdio: 'inherit' });
     console.log(`EP Room Desktop ${version} installed (deb).`);
     return;
@@ -201,10 +236,13 @@ function linuxInstall(file, version, deb) {
 function winVersion() {
   const exe = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'ep-room-desktop', 'EP Room Desktop.exe');
   if (!fs.existsSync(exe)) return '';
-  const r = spawnSync('powershell', ['-NoProfile', '-Command', `(Get-Item '${exe}').VersionInfo.ProductVersion`], { encoding: 'utf8' });
+  const r = spawnSync('powershell', ['-NoProfile', '-Command', '(Get-Item -LiteralPath $env:EP_ROOM_DESKTOP_EXE).VersionInfo.ProductVersion'], { encoding: 'utf8', env: { ...process.env, EP_ROOM_DESKTOP_EXE: exe } });
   return String(r.stdout || '').trim();
 }
 function winInstall(file, version) {
+  // The silent installer closes a running app; a Call must never be cut off, so refuse while it is open.
+  const t = spawnSync('tasklist', ['/FI', 'IMAGENAME eq EP Room Desktop.exe', '/NH'], { encoding: 'utf8' });
+  if (/EP Room Desktop\.exe/i.test(String(t.stdout || ''))) throw new Error('EP Room Desktop is open. Quit it, then run this again.');
   const r = spawnSync(file, ['/S'], { stdio: 'inherit' });
   if (r.status !== 0) throw new Error(`The installer exited ${r.status}. If EP Room Desktop is open, quit it and run this again.`);
   console.log(`EP Room Desktop ${version} installed.`);
@@ -218,7 +256,9 @@ function installedVersion(platform) {
 }
 
 async function update(flags) {
-  const platform = process.platform, arch = process.arch;
+  const platform = process.platform;
+  // x64 Node under Rosetta on an Apple Silicon Mac still installs the arm64 app.
+  const arch = platform === 'darwin' && spawnSync('sysctl', ['-n', 'hw.optional.arm64'], { encoding: 'utf8' }).stdout.trim() === '1' ? 'arm64' : process.arch;
   const have = installedVersion(platform);
   const rel = await latestRelease();
   console.log(`installed: ${have || 'none'}; latest: ${rel.version} (${rel.url})`);
@@ -256,4 +296,4 @@ async function main(argv) {
 if (require.main === module) {
   main(process.argv.slice(2)).then(code => process.exit(code || 0), e => { console.error(`ep-room desktop: ${e && e.message ? e.message : e}`); process.exit(1); });
 }
-module.exports = { compareVersions, pickAsset, parseSums, main };
+module.exports = { compareVersions, pickAsset, parseSums, main, WATCHER };
