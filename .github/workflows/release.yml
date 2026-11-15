@@ -76,7 +76,7 @@ jobs:
           v=$(node -p "require('./package.json').version")
           [ "$v" = "${{ needs.source.outputs.version }}" ] || { echo "electron/package.json says $v, SOURCE.json says ${{ needs.source.outputs.version }}"; exit 1; }
           npm ci --no-audit --no-fund
-          node --test test/updater.test.cjs test/mac-release.test.cjs test/package-win.test.cjs test/security.test.cjs test/config.test.cjs
+          node --test test/updater.test.cjs test/mac-release.test.cjs test/package-win.test.cjs test/security.test.cjs test/config.test.cjs test/terminal.test.cjs test/terminal-pty.test.cjs
       - name: Build (macOS arm64 + x64; Developer ID signed and notarized, or ad-hoc without the secrets)
         if: matrix.target == 'mac'
         working-directory: src/electron
@@ -133,6 +133,21 @@ jobs:
           done
           echo "signed=$signed" > "$out/mac-signing.txt"
           cp EP-Room-Desktop-*.zip EP-Room-Desktop-*.dmg *.blockmap latest-mac.yml "$out/"
+      - name: Terminal self-test (macOS, the packaged app starts a shell through node-pty)
+        if: matrix.target == 'mac'
+        working-directory: src/electron
+        run: |
+          node scripts/pty-selftest.mjs "dist/mac-release/mac-arm64/EP Room Desktop.app/Contents/MacOS/EP Room Desktop"
+          x64_helper="dist/mac-release/mac/EP Room Desktop.app/Contents/Resources/app.asar.unpacked/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper"
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            # Under Rosetta a first launch can be slow: no answer in time (exit 3) is a warning plus the file check; a wrong answer fails.
+            rc=0; EP_PTY_SELFTEST_TIMEOUT_MS=240000 node scripts/pty-selftest.mjs "dist/mac-release/mac/EP Room Desktop.app/Contents/MacOS/EP Room Desktop" || rc=$?
+            if [ "$rc" = 3 ]; then echo "::warning::the x64 app did not answer under Rosetta in time; its node-pty is checked by file"; test -x "$x64_helper"
+            elif [ "$rc" != 0 ]; then exit "$rc"; fi
+          else
+            echo "no Rosetta on this runner: the x64 app's node-pty is checked by file only"
+            test -x "$x64_helper"
+          fi
       - name: Build (Windows x64, unsigned)
         if: matrix.target == 'win'
         working-directory: src/electron
@@ -141,6 +156,7 @@ jobs:
           npm run package:win
           mkdir -p ../../out
           cp dist/win/EP-Room-Desktop-Setup-*.exe dist/win/EP-Room-Desktop-Setup-*.exe.blockmap dist/win/latest.yml ../../out/
+          node scripts/pty-selftest.mjs "dist/win/win-unpacked/EP Room Desktop.exe"
       - name: Build (Linux x64, AppImage + deb)
         if: matrix.target == 'linux'
         working-directory: src/electron
@@ -149,6 +165,8 @@ jobs:
           mkdir -p ../../out
           cp dist/linux/EP-Room-Desktop-*.AppImage dist/linux/EP-Room-Desktop-*.deb dist/linux/latest-linux.yml ../../out/
           cp dist/linux/*.blockmap ../../out/ 2>/dev/null || true
+          command -v xvfb-run >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q xvfb; }
+          xvfb-run -a node scripts/pty-selftest.mjs dist/linux/linux-unpacked/ep-room-desktop --no-sandbox
       - run: ls -la out
         shell: bash
       - uses: actions/upload-artifact@v4
