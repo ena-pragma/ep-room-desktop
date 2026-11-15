@@ -1,0 +1,143 @@
+# Builds EP Room Desktop from the private source commit named in release/SOURCE.json and publishes desktop-v<version> here.
+# Canonical copy: ena-pragma/ep-room electron/release-repo/.github/workflows/release.yml (synced by its desktop-release workflow).
+# Secrets: EP_ROOM_READ_KEY, a READ-ONLY deploy key of ena-pragma/ep-room (only the checkout steps get it).
+# No signing secrets exist yet: macOS is ad-hoc signed, Windows is unsigned (named UNSIGNED-TEST), Linux needs none.
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: ['release/SOURCE.json']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.s.outputs.version }}
+      commit: ${{ steps.s.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: s
+        run: |
+          version=$(jq -r .version release/SOURCE.json); commit=$(jq -r .commit release/SOURCE.json)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version '$version'"; exit 1; }
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "bad commit '$commit'"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"; echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "EP Room Desktop $version from ${commit:0:7}" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: mac, os: macos-14 }
+          - { target: win, os: windows-2022 }
+          - { target: linux, os: ubuntu-22.04 }
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      EP_ROOM_BUILD_COMMIT: ${{ needs.source.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ena-pragma/ep-room
+          ref: ${{ needs.source.outputs.commit }}
+          ssh-key: ${{ secrets.EP_ROOM_READ_KEY }}
+          sparse-checkout: electron
+          persist-credentials: false
+          path: src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install and test
+        working-directory: src/electron
+        shell: bash
+        run: |
+          v=$(node -p "require('./package.json').version")
+          [ "$v" = "${{ needs.source.outputs.version }}" ] || { echo "electron/package.json says $v, SOURCE.json says ${{ needs.source.outputs.version }}"; exit 1; }
+          npm ci --no-audit --no-fund
+          node --test test/updater.test.cjs test/mac-release.test.cjs test/package-win.test.cjs test/security.test.cjs test/config.test.cjs
+      - name: Build (macOS, ad-hoc signed, arm64 + x64)
+        if: matrix.target == 'mac'
+        working-directory: src/electron
+        env:
+          EP_ROOM_MAC_ADHOC: '1'
+        run: |
+          node scripts/package-mac-release.mjs
+          mkdir -p ../../out && cd dist/mac-release
+          for z in EP-Room-Desktop-*-arm64.zip EP-Room-Desktop-*-x64.zip; do
+            d=$(mktemp -d); ditto -x -k "$z" "$d"; codesign --verify --deep --strict "$d/EP Room Desktop.app"
+            echo "$z: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$d/EP Room Desktop.app/Contents/Info.plist"), $(lipo -archs "$d/EP Room Desktop.app/Contents/MacOS/EP Room Desktop"), signature ok"
+          done
+          cp EP-Room-Desktop-*.zip EP-Room-Desktop-*.dmg *.blockmap latest-mac.yml ../../../../out/
+      - name: Build (Windows x64, unsigned)
+        if: matrix.target == 'win'
+        working-directory: src/electron
+        shell: bash
+        run: |
+          npm run package:win
+          mkdir -p ../../out
+          cp dist/win/EP-Room-Desktop-Setup-*.exe dist/win/EP-Room-Desktop-Setup-*.exe.blockmap dist/win/latest.yml ../../out/
+      - name: Build (Linux x64, AppImage + deb)
+        if: matrix.target == 'linux'
+        working-directory: src/electron
+        run: |
+          npm run package:linux
+          mkdir -p ../../out
+          cp dist/linux/EP-Room-Desktop-*.AppImage dist/linux/EP-Room-Desktop-*.deb dist/linux/latest-linux.yml ../../out/
+          cp dist/linux/*.blockmap ../../out/ 2>/dev/null || true
+      - run: ls -la out
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    needs: [source, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: Checksums
+        working-directory: files
+        run: |
+          v='${{ needs.source.outputs.version }}'
+          for f in latest-mac.yml latest.yml latest-linux.yml; do grep -q "^version: $v$" "$f" || { echo "$f is not version $v"; exit 1; }; done
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS; { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish desktop-v${{ needs.source.outputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v='${{ needs.source.outputs.version }}'; c='${{ needs.source.outputs.commit }}'
+          if gh release view "desktop-v$v" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "desktop-v$v already exists; not replacing it"; exit 1; fi
+          notes="EP Room Desktop $v, built from source ${c:0:7}.
+
+          Install or update: \`npx -y github:ena-pragma/ep-room-desktop\` or \`ep-room desktop update\`.
+          macOS: ad-hoc signed, not notarized. Windows: unsigned. Checksums: SHA256SUMS."
+          gh release create "desktop-v$v" files/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "EP Room Desktop $v" --notes "$notes" --latest
+      - name: Read the feed back
+        run: |
+          v='${{ needs.source.outputs.version }}'
+          for f in latest-mac.yml latest.yml latest-linux.yml; do
+            for i in 1 2 3 4 5 6; do curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$f" | grep -q "^version: $v$" && break; sleep 10; done
+            curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$f" | grep -q "^version: $v$" || { echo "the feed's $f is not $v"; exit 1; }
+            echo "$f: $v"
+          done

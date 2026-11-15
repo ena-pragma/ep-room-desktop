@@ -1,0 +1,259 @@
+#!/usr/bin/env node
+'use strict';
+// ep-room desktop: install or update EP Room Desktop from its public releases (docs: ep-room-desktop-updates).
+//
+//   ep-room desktop update [--check] [--force] [--stage]   newest release: download, verify sha256, install
+//   ep-room desktop version                                what is installed here
+//
+// The same file is the npx form, run from the public release repository (no GitHub sign-in needed):
+//   npx -y github:ena-pragma/ep-room-desktop            (= update)
+//
+// Releases: https://github.com/ena-pragma/ep-room-desktop/releases (the in-app updater's feed). Every asset is checked against
+// the release's SHA256SUMS (and GitHub's own asset digest when the API gives one) before anything is installed.
+//   macOS    the zip for this Mac (arm64 or x64), quarantine cleared, signature verified; replaces the app where it is
+//            (~/Applications, else /Applications; a new install goes to ~/Applications). If the app is running it is never
+//            quit: the new app is staged and a background watcher swaps it in the first time the app is not running. The
+//            old app is kept in ~/Applications/_rollback.
+//   Linux    a deb install (dpkg -s ep-room-desktop) is updated with sudo dpkg -i; otherwise the AppImage goes to
+//            ~/.local/bin/ep-room-desktop (a running AppImage keeps running; the next launch is the new one).
+//   Windows  the per-user installer runs silently (/S).
+// --check  only says whether an update exists.  --force  reinstalls the same version.  --stage  macOS: always stage and
+// install on quit, even when the app is not running.  EP_ROOM_DESKTOP_REPO overrides the repository (owner/name), for tests.
+// Exit codes: 0 done or up to date, 1 failed, 2 usage, 10 (--check) an update exists.
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
+
+const REPO = process.env.EP_ROOM_DESKTOP_REPO || 'ena-pragma/ep-room-desktop';
+const APP_NAME = 'EP Room Desktop.app';
+const UA = 'ep-room-desktop-update';
+
+function usage(code = 2) {
+  console.error('usage: ep-room desktop update [--check] [--force] [--stage] | ep-room desktop version');
+  process.exit(code);
+}
+
+/** "0.3.10" > "0.3.9"; a pre-release suffix sorts below its release. */
+function compareVersions(a, b) {
+  const parse = v => String(v || '').replace(/^v/, '').split('-');
+  const [ma, pa] = parse(a), [mb, pb] = parse(b);
+  const na = ma.split('.').map(n => Number(n) || 0), nb = mb.split('.').map(n => Number(n) || 0);
+  for (let i = 0; i < Math.max(na.length, nb.length); i++) {
+    const d = (na[i] || 0) - (nb[i] || 0);
+    if (d) return Math.sign(d);
+  }
+  if (pa && !pb) return -1;
+  if (!pa && pb) return 1;
+  return 0;
+}
+
+/** Which release asset this machine installs. */
+function pickAsset(assets, { platform, arch, deb = false }) {
+  const names = assets.map(a => a.name);
+  let re;
+  if (platform === 'darwin') re = new RegExp(`^EP-Room-Desktop-[\\d.]+-${arch === 'arm64' ? 'arm64' : 'x64'}\\.zip$`);
+  else if (platform === 'linux') re = deb ? /^EP-Room-Desktop-[\d.]+-amd64\.deb$/ : /^EP-Room-Desktop-[\d.]+-x86_64\.AppImage$/;
+  else if (platform === 'win32') re = /^EP-Room-Desktop-Setup-[\d.]+-x64(-UNSIGNED-TEST)?\.exe$/;
+  else throw new Error(`EP Room Desktop has no build for ${platform}.`);
+  if (platform === 'linux' && arch !== 'x64') throw new Error(`EP Room Desktop's Linux build is x64 only; this machine is ${arch}.`);
+  const name = names.find(n => re.test(n));
+  if (!name) throw new Error(`The latest release has no file for ${platform} ${arch}.`);
+  return assets.find(a => a.name === name);
+}
+
+/** SHA256SUMS ("<hex>  <name>" lines) -> Map name -> hex. */
+function parseSums(text) {
+  const m = new Map();
+  for (const line of String(text).split(/\r?\n/)) {
+    const r = /^([0-9a-f]{64})\s+\*?(.+)$/i.exec(line.trim());
+    if (r) m.set(r[2].trim(), r[1].toLowerCase());
+  }
+  return m;
+}
+
+async function get(url, as = 'json') {
+  const res = await fetch(url, { headers: { 'user-agent': UA, accept: as === 'json' ? 'application/vnd.github+json' : '*/*' }, redirect: 'follow' });
+  if (!res.ok) throw new Error(`${url} answered ${res.status}`);
+  return as === 'json' ? res.json() : as === 'text' ? res.text() : Buffer.from(await res.arrayBuffer());
+}
+
+async function latestRelease() {
+  const r = await get(`https://api.github.com/repos/${REPO}/releases/latest`);
+  const version = String(r.tag_name || '').replace(/^desktop-v|^v/, '');
+  if (!/^\d+\.\d+\.\d+/.test(version)) throw new Error(`The latest release's tag (${r.tag_name}) is not a version.`);
+  return { version, tag: r.tag_name, url: r.html_url, assets: (r.assets || []).map(a => ({ name: a.name, url: a.browser_download_url, size: a.size, digest: a.digest || '' })) };
+}
+
+async function download(asset, sums, dir) {
+  const want = sums.get(asset.name);
+  if (!want) throw new Error(`SHA256SUMS in the release does not list ${asset.name}; nothing installed.`);
+  process.stdout.write(`downloading ${asset.name} (${Math.round((asset.size || 0) / 1048576)} MB)... `);
+  const buf = await get(asset.url, 'buffer');
+  const got = crypto.createHash('sha256').update(buf).digest('hex');
+  if (got !== want) throw new Error(`sha256 mismatch for ${asset.name}: got ${got}, the release says ${want}; nothing installed.`);
+  if (/^sha256:/.test(asset.digest) && asset.digest.slice(7).toLowerCase() !== got) throw new Error(`sha256 differs from GitHub's digest for ${asset.name}; nothing installed.`);
+  const file = path.join(dir, asset.name);
+  fs.writeFileSync(file, buf);
+  console.log(`sha256 ok (${got.slice(0, 12)}...)`);
+  return file;
+}
+
+// ---- macOS ----------------------------------------------------------------------------------------------------------
+const plist = (app, key) => {
+  try { return execFileSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, path.join(app, 'Contents', 'Info.plist')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return ''; }
+};
+function macInstalled() {
+  for (const dir of [path.join(os.homedir(), 'Applications'), '/Applications']) {
+    const app = path.join(dir, APP_NAME);
+    if (fs.existsSync(app)) return { app, version: plist(app, 'CFBundleShortVersionString') };
+  }
+  return { app: path.join(os.homedir(), 'Applications', APP_NAME), version: '' };
+}
+const macRunning = app => spawnSync('pgrep', ['-f', `${app}/Contents/MacOS/`], { stdio: 'ignore' }).status === 0;
+const stamp = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; };
+
+// The watcher a running app gets (from install-when-quit.sh): wait until the app is not running, then swap, keep the old
+// app in _rollback, verify, and put the old one back on any failure. Never quits the app, never relaunches it.
+const WATCHER = `#!/bin/bash
+NEW="$1"; APP="$2"; LOG="$3"; ROLLBACK="$(dirname "$APP")/_rollback"
+say() { echo "$(date "+%Y-%m-%d %I:%M:%S %p") $*" >> "$LOG"; }
+running() { pgrep -f "$APP/Contents/MacOS/" >/dev/null; }
+end=$(( $(date +%s) + 7*86400 ))
+say "armed (pid $$): $NEW waits for EP Room Desktop to be quit (up to 7 days)"
+while running; do [ "$(date +%s)" -ge "$end" ] && { say "gave up after 7 days, nothing changed"; exit 1; }; sleep 5; done
+sleep 2; running && exec "$0" "$@"
+mkdir -p "$ROLLBACK"; BAK="$ROLLBACK/EP Room Desktop.app.bak-$(date +%Y%m%d-%H%M%S)"
+if [ -d "$APP" ]; then mv "$APP" "$BAK" || { say "could not move the old app aside, nothing changed"; exit 1; }; fi
+if ditto "$NEW" "$APP" && codesign --verify --deep --strict "$APP" 2>>"$LOG"; then
+  say "installed $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist"); old app kept at $BAK"
+  rm -rf "$(dirname "$NEW")"
+else
+  say "install failed, putting the old app back"; rm -rf "$APP"; [ -d "$BAK" ] && mv "$BAK" "$APP"; exit 1
+fi
+`;
+
+function macInstall(zip, version, { stage }) {
+  const { app, version: had } = macInstalled();
+  const updates = path.join(os.homedir(), 'Library', 'Application Support', 'EP Room Desktop Updates');
+  const dir = path.join(updates, version);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  execFileSync('ditto', ['-x', '-k', zip, dir]);
+  const fresh = path.join(dir, APP_NAME);
+  if (!fs.existsSync(fresh)) throw new Error('The zip holds no EP Room Desktop.app.');
+  spawnSync('xattr', ['-dr', 'com.apple.quarantine', fresh]);
+  execFileSync('codesign', ['--verify', '--deep', '--strict', fresh], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const v = plist(fresh, 'CFBundleShortVersionString');
+  if (v !== version) throw new Error(`The downloaded app says ${v}, not ${version}.`);
+  if (stage || macRunning(app)) {
+    const log = path.join(updates, 'install.log');
+    const watcher = path.join(updates, 'install-when-quit.sh');
+    fs.writeFileSync(watcher, WATCHER, { mode: 0o755 });
+    const child = spawn('/bin/bash', [watcher, fresh, app, log], { detached: true, stdio: 'ignore' });
+    child.unref();
+    console.log(`EP Room Desktop ${version} is staged; it installs the next time EP Room Desktop is quit (${had || 'nothing'} now). Log: ${log}`);
+    return;
+  }
+  fs.mkdirSync(path.dirname(app), { recursive: true });
+  let bak = '';
+  if (fs.existsSync(app)) {
+    const rb = path.join(path.dirname(app), '_rollback');
+    fs.mkdirSync(rb, { recursive: true });
+    bak = path.join(rb, `${APP_NAME}.bak-${stamp()}`);
+    fs.renameSync(app, bak);
+  }
+  try {
+    execFileSync('ditto', [fresh, app]);
+    execFileSync('codesign', ['--verify', '--deep', '--strict', app], { stdio: ['ignore', 'ignore', 'pipe'] });
+  } catch (e) {
+    fs.rmSync(app, { recursive: true, force: true });
+    if (bak) fs.renameSync(bak, app);
+    throw new Error(`Installing failed, the old app is back: ${e.message}`);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  console.log(`EP Room Desktop ${version} installed at ${app}${bak ? ` (old app kept at ${bak})` : ''}.`);
+}
+
+// ---- Linux and Windows -------------------------------------------------------------------------------------------------
+const linuxDeb = () => spawnSync('dpkg', ['-s', 'ep-room-desktop'], { stdio: 'ignore' }).status === 0;
+const linuxAppImage = () => path.join(os.homedir(), '.local', 'bin', 'ep-room-desktop');
+function linuxVersion(deb) {
+  if (deb) { try { return execFileSync('dpkg-query', ['-W', '-f=${Version}', 'ep-room-desktop'], { encoding: 'utf8' }).trim(); } catch { return ''; } }
+  try { return fs.readFileSync(`${linuxAppImage()}.version`, 'utf8').trim(); } catch { return ''; }
+}
+function linuxInstall(file, version, deb) {
+  if (deb) {
+    execFileSync('sudo', ['dpkg', '-i', file], { stdio: 'inherit' });
+    console.log(`EP Room Desktop ${version} installed (deb).`);
+    return;
+  }
+  const dest = linuxAppImage();
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  const tmp = `${dest}.new`;
+  fs.copyFileSync(file, tmp);
+  fs.chmodSync(tmp, 0o755);
+  fs.renameSync(tmp, dest);
+  fs.writeFileSync(`${dest}.version`, `${version}\n`);
+  console.log(`EP Room Desktop ${version} installed at ${dest}.`);
+}
+function winVersion() {
+  const exe = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'ep-room-desktop', 'EP Room Desktop.exe');
+  if (!fs.existsSync(exe)) return '';
+  const r = spawnSync('powershell', ['-NoProfile', '-Command', `(Get-Item '${exe}').VersionInfo.ProductVersion`], { encoding: 'utf8' });
+  return String(r.stdout || '').trim();
+}
+function winInstall(file, version) {
+  const r = spawnSync(file, ['/S'], { stdio: 'inherit' });
+  if (r.status !== 0) throw new Error(`The installer exited ${r.status}. If EP Room Desktop is open, quit it and run this again.`);
+  console.log(`EP Room Desktop ${version} installed.`);
+}
+
+function installedVersion(platform) {
+  if (platform === 'darwin') return macInstalled().version;
+  if (platform === 'linux') return linuxVersion(linuxDeb());
+  if (platform === 'win32') return winVersion();
+  return '';
+}
+
+async function update(flags) {
+  const platform = process.platform, arch = process.arch;
+  const have = installedVersion(platform);
+  const rel = await latestRelease();
+  console.log(`installed: ${have || 'none'}; latest: ${rel.version} (${rel.url})`);
+  const newer = !have || compareVersions(rel.version, have) > 0;
+  if (flags.check) { console.log(newer ? 'an update is available' : 'up to date'); return newer ? 10 : 0; }
+  if (!newer && !flags.force) { console.log(`EP Room Desktop ${have} is up to date.`); return 0; }
+  const deb = platform === 'linux' && linuxDeb();
+  const asset = pickAsset(rel.assets, { platform, arch, deb });
+  const sumsAsset = rel.assets.find(a => a.name === 'SHA256SUMS');
+  if (!sumsAsset) throw new Error('The latest release has no SHA256SUMS; nothing installed.');
+  const sums = parseSums(await get(sumsAsset.url, 'text'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-room-desktop-'));
+  try {
+    const file = await download(asset, sums, tmp);
+    if (platform === 'darwin') macInstall(file, rel.version, { stage: flags.stage });
+    else if (platform === 'linux') linuxInstall(file, rel.version, deb);
+    else winInstall(file, rel.version);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  return 0;
+}
+
+async function main(argv) {
+  const args = argv.filter(a => !a.startsWith('--'));
+  const flags = { check: argv.includes('--check'), force: argv.includes('--force'), stage: argv.includes('--stage') };
+  for (const a of argv) if (a.startsWith('--') && !['--check', '--force', '--stage'].includes(a)) usage();
+  if (argv.includes('-h') || argv.includes('help')) usage(0);
+  const cmd = args[0] || 'update';
+  if (cmd === 'version') { console.log(installedVersion(process.platform) || 'not installed'); return 0; }
+  if (cmd !== 'update' || args.length > 1) usage();
+  return update(flags);
+}
+
+if (require.main === module) {
+  main(process.argv.slice(2)).then(code => process.exit(code || 0), e => { console.error(`ep-room desktop: ${e && e.message ? e.message : e}`); process.exit(1); });
+}
+module.exports = { compareVersions, pickAsset, parseSums, main };

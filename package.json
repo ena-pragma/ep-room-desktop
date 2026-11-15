@@ -1,0 +1,8 @@
+{
+  "name": "ep-room-desktop-update",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Install or update EP Room Desktop from its public releases",
+  "bin": { "ep-room-desktop": "bin/ep-room-desktop" },
+  "engines": { "node": ">=18" }
+}
